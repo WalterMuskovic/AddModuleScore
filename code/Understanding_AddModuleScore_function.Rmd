@@ -1,0 +1,249 @@
+---
+title: "Investigating Seurat's AddModuleScore function"
+author: "Walter Muskovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: journal
+    df_print: paged
+    toc: true
+    toc_float: true
+    collapsed: false
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+```{r global_options, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."), tidy = TRUE, warning = FALSE, message = FALSE,
+                     cache = FALSE, cache.lazy = FALSE)
+```
+
+The source R Markdown document is available here: 
+```{r embed_Rmd, echo=FALSE}
+# Embed a copy of the Rmd source file in the HTML output
+xfun::embed_file('code/Understanding_AddModuleScore_function.Rmd')
+```
+
+From `?AddModuleScore` we get the following information:
+
+Calculate the average expression levels of each program (cluster) on single cell level, subtracted by the aggregated expression of control feature sets. All analyzed features are binned based on averaged expression, and the control features are randomly selected from each bin.
+
+In the source code the authors reference [Tirosh et al, Science, 2016](https://doi.org/10.1126/science.aad0501). From the supplementary materials we get the following:
+
+The  top 100  MITF-correlated  genes  across  the  entire  set  of  malignant  cells  were  defined as  the MITF  program,  and  their  average  relative  expression  as  the  MITF-program  cell  score.  The average expression of the top 100 genes that negatively correlate with the MITF program scores were defined as the AXL program and used to define AXL program cell score. To decrease the effect that the quality and complexity of each cell’s data might have on its MITF/AXL scores we defined  control  gene-sets  and  their  average  relative  expression  as  control  scores,  for  both  the MITF  and  AXL  programs.  These  control  cell  scores  were  subtracted  from  the  respective MITF/AXL  cell  scores.  The  control  gene-sets  were  defined  by  first  binning  all  analyzed  genes into 25 bins of aggregate expression levels and then, for each  gene in the  MITF/AXL  gene-set, randomly selecting 100 genes from the same expression bin as that gene.  In this way,  a control gene-sets have a comparable distribution of expression levels to that of the MITF/AXL gene-set and  the  control  gene  set  is  100-fold  larger,  such  that  its  average  expression  is  analogous  to averaging over 100 randomly-selected gene-sets of the same size as the MITF/AXL gene-set. To calculate significance of  the changes in AXL  and MITF programs upon relapse, we defined the expression  log2-ratio  between  matched  pre- and  post- samples  for all  AXL  and  MITF  program genes  (Fig.  3D).  Since  AXL  and  MITF  programs  are  inversely  related,  we  flipped  the  signs  of the  log-ratios  for  MITF  program  genes  and  used  a  t-test to  examine  if  the  average  of  the combined  set  of  AXL  program  and  (sign-flipped)  MITF  program  genes  is  significantly  higher than zero, which was the case for four out of six matched sample pairs (Fig. 3D, black arrows).
+
+The code for the function is here:
+
+```{r}
+library(Seurat)
+AddModuleScore
+```
+
+```{r}
+## Load library rlang - need for %||% to work 
+library(rlang)
+
+## Define two small functions called withing AddModuleScore
+# Define small function to check the length of components of a list
+LengthCheck <- function(values, cutoff = 0) {
+  return(vapply(
+    X = values,
+    FUN = function(x) {
+      return(length(x = x) > cutoff)
+    },
+    FUN.VALUE = logical(1)
+  ))
+}
+# Call gc() to perform garbage collection
+CheckGC <- function() {
+  if (getOption(x = "Seurat.memsafe")) {
+    gc(verbose = FALSE)
+  }
+}
+
+## Define variables to input to the AddModuleScore function
+object <- pbmc_small
+features <- list(c('CD79B','CD79A','CD19','CD180','CD200','CD3D','CD2','CD3E','CD7','CD8A','CD14','CD1C','CD68','CD9','CD247'))
+pool <- NULL
+nbin <- 24
+ctrl <- 5
+k <-  FALSE
+assay <- NULL
+name <- "Cluster"
+seed <- 1
+search <- FALSE
+
+## Now we can go through the inner workings of the function and inspect what happens at every step
+# The first half of the code is checks and balances - small adjustments to the input variables and making sure they are of the expected form
+# The second half of the code contains the actual operations performed by the function. I've heavily annotated the code explaining what each step does. I also inlcuded an explanatory plot, depicting how the genes are ranked and binned, and how the control genes are selected from those bins.
+
+#myAddModuleScore <- function (object, features, pool = NULL, nbin = 24, ctrl = 100, k = FALSE, assay = NULL, name = "Cluster", seed = 1, search = FALSE) {
+    set.seed(seed = seed)
+    assay.old <- DefaultAssay(object = object)
+    assay <- assay %||% assay.old 
+    # If requested, the default assay is switched to the requested assay - it is switched back just before the object is returned at the end of the function
+    DefaultAssay(object = object) <- assay
+    assay.data <- GetAssayData(object = object)
+    features.old <- features
+    
+    ### Checks and balances
+    if (k) {
+        .NotYetUsed(arg = "k")
+        features <- list()
+        for (i in as.numeric(x = names(x = table(object@kmeans.obj[[1]]$cluster)))) {
+            features[[i]] <- names(x = which(x = object@kmeans.obj[[1]]$cluster == i))
+            }
+        cluster.length <- length(x = features)
+    } else {
+      if (is.null(x = features)) {
+        stop("Missing input feature list")
+        }
+      
+      # Check all features are present (in the rownames of the object). If some features are missing, print a warning. If search is set to TRUE, try and update.
+      # Save the number of gene lists provided in the variable `cluster.length` e.g. if we provided two gene lists; g2m.features and s.features, then cluster.length=2
+        features <- lapply(X = features, FUN = function(x) {
+            missing.features <- setdiff(x = x, y = rownames(x = object))
+            if (length(x = missing.features) > 0) {
+                warning("The following features are not present in the object: ", 
+                  paste(missing.features, collapse = ", "), ifelse(test = search, 
+                    yes = ", attempting to find updated synonyms", 
+                    no = ", not searching for symbol synonyms"), 
+                  call. = FALSE, immediate. = TRUE)
+                if (search) {
+                  tryCatch(expr = {
+                    updated.features <- UpdateSymbolList(symbols = missing.features, 
+                      ...)
+                    names(x = updated.features) <- missing.features
+                    for (miss in names(x = updated.features)) {
+                      index <- which(x == miss)
+                      x[index] <- updated.features[miss]
+                    }
+                  }, error = function(...) {
+                    warning("Could not reach HGNC's gene names database", 
+                      call. = FALSE, immediate. = TRUE)
+                  })
+                  missing.features <- setdiff(x = x, y = rownames(x = object))
+                  if (length(x = missing.features) > 0) {
+                    warning("The following features are still not present in the object: ", 
+                      paste(missing.features, collapse = ", "), 
+                      call. = FALSE, immediate. = TRUE)
+                  }
+                }
+            }
+            return(intersect(x = x, y = rownames(x = object)))
+        })
+        cluster.length <- length(x = features)
+    }
+    
+    # Check that none of the gene lists are empty
+    if (!all(LengthCheck(values = features))) {
+        warning(paste("Could not find enough features in the object from the following feature lists:", 
+            paste(names(x = which(x = !LengthCheck(values = features)))), 
+            "Attempting to match case..."))
+        features <- lapply(X = features.old, FUN = CaseMatch, 
+            match = rownames(x = object))
+    }
+    # Check to see if difference in case was causing the problem
+    if (!all(LengthCheck(values = features))) {
+        stop(paste("The following feature lists do not have enough features present in the object:", 
+            paste(names(x = which(x = !LengthCheck(values = features)))), 
+            "exiting..."))
+    }
+    
+    #### End of checks and balances, calculations start here
+    # Store all of the gene names from the object
+    pool <- pool %||% rownames(x = object)
+    # For all genes, get the average expression across all cells
+    data.avg <- Matrix::rowMeans(x = assay.data[pool, ])
+    # Order genes from lowest average expression to highest average expression
+    data.avg <- data.avg[order(data.avg)]
+    # Use ggplot2's cut_number function to make n groups with (approximately) equal numbers of observations. I'm not sure what the purpose of 'rnorm(n = length(data.avg))/1e+30' is. I assume we're ading this tiny bit of noise to the data to break ties
+    data.cut <- ggplot2::cut_number(x = data.avg + rnorm(n = length(data.avg))/1e+30, n = nbin, labels = FALSE, right = FALSE)
+    # Set the names of the cuts as the gene names
+    names(x = data.cut) <- names(x = data.avg)
+    # Create an empty list the same length as the number of input gene sets. This will contain the NAMES of the control genes
+    ctrl.use <- vector(mode = "list", length = cluster.length)
+    
+    # For each of the input gene lists:
+    for (i in 1:cluster.length) {
+      # Get the gene names from the input gene set as a character vector  
+      features.use <- features[[i]]
+      # Loop through 1:num_genes
+      # For each gene, find ctrl (default=100) genes from the same expression bin (by looking in data.cut)
+      for (j in 1:length(x = features.use)) {
+            # 'data.cut[features.use[j]]' gives us the expression bin number
+            # We then sample `ctrl` genes from that bin without replacement
+            # We add the gene names to ctrl.use
+            ctrl.use[[i]] <- c(ctrl.use[[i]],
+                               names(x = sample(x = data.cut[which(x = data.cut == data.cut[features.use[j]])],
+                                                size = ctrl,
+                                                replace = FALSE)))
+        }
+    }
+    
+    # The following explanatory plot should explain what's happened so far
+    plot(data.avg, pch=16, ylab="Average expression across all cells", xlab="All genes")
+    for(i in unique(data.cut)){
+    cut_pos <- which(data.cut==i)
+    if(i%%2==0){
+      rect(xleft = cut_pos[1], ybottom = min(data.avg), xright = cut_pos[length(cut_pos)], ytop = max(data.avg), col=scales::alpha("grey", 0.3))
+    } else {
+      rect(xleft = cut_pos[1], ybottom = min(data.avg), xright = cut_pos[length(cut_pos)], ytop = max(data.avg), col=scales::alpha("white", 0.3))
+    }
+    }
+    # Add red points for selected control genes
+    points(which(names(data.avg)%in%ctrl.use[[1]]), data.avg[which(names(data.avg)%in%ctrl.use[[1]])], pch=16, col="red")
+    # Add blue points for genes in input gene list
+    points(which(names(data.avg)%in%features[[1]]), data.avg[which(names(data.avg)%in%features[[1]])], pch=16, col="blue")
+    
+    # Remove any repeated gene names - even though we set replace=FALSE when we sampled genes from the same expression bin, often there will be more than two genes in our input gene list that fall in the same expression bin, so we can end up sampling the same gene more than once
+    ctrl.use <- lapply(X = ctrl.use, FUN = unique)
+    
+    ## Get control gene scores
+    # Create an empty matrix of dimensions;
+      # number of rows equal to number of gene sets
+      # number of columns equal to number of cells in input Seurat object
+    ctrl.scores <- matrix(data = numeric(length = 1L), nrow = length(x = ctrl.use), ncol = ncol(x = object))
+    # Loop through each provided gene set and add to the empty matrix save the mean expression of the control genes in each cell
+    for (i in 1:length(ctrl.use)) {
+      # Get control gene names as a vector  
+      features.use <- ctrl.use[[i]]
+      # For each cell, calculate the mean expression of all of the control genes 
+      ctrl.scores[i, ] <- Matrix::colMeans(x = assay.data[features.use,])
+    }
+    
+    ## Get scores for input gene sets
+    # create empty matrix
+    features.scores <- matrix(data = numeric(length = 1L), nrow = cluster.length, ncol = ncol(x = object))
+    # Loop through input gene sets and calculate the mean expression of these genes for each cell
+    for (i in 1:cluster.length) {
+        features.use <- features[[i]]
+        data.use <- assay.data[features.use, , drop = FALSE]
+        features.scores[i, ] <- Matrix::colMeans(x = data.use)
+    }
+    
+    ## We now have two matrices;
+      # ctrl.scores - contains the mean expression of the control genes for each cell
+      # features.scores - contains the mean expression of the genes in the input gene set for each cell
+    
+    # Subtract the control scores from the feature scores - the idea is that if there is no enrichment of the genes in the geneset in a cell, then the result of this subtraction should be ~ 0
+    features.scores.use <- features.scores - ctrl.scores
+    
+    # Name the result the "name" variable + whatever the position the geneset was in the input list, e.g. "Cluster1"
+    rownames(x = features.scores.use) <- paste0(name, 1:cluster.length)
+    # Change the matrix from wide to long
+    features.scores.use <- as.data.frame(x = t(x = features.scores.use))
+    # Give the rows of the matric, the names of the cells
+    rownames(x = features.scores.use) <- colnames(x = object)
+    
+    # Add the result as a metadata column to the input Seurat object 
+    object[[colnames(x = features.scores.use)]] <- features.scores.use
+    # Clean up
+    CheckGC()
+    # Change the default assay back to whatever it was when the object was input
+    DefaultAssay(object = object) <- assay.old
+    # Return the input Seurat object, now with an additional metadata column containing the module scores for the input gene sets
+    #return(object)
+#}
+```
